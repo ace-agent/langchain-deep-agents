@@ -1,7 +1,7 @@
 import re
 from pydantic import BaseModel
 from langchain_openai import ChatOpenAI
-from langchain_core.messages import SystemMessage, HumanMessage, ToolMessage
+from langchain_core.messages import SystemMessage, HumanMessage, ToolMessage, AIMessage
 
 from tools import read_file, edit_file, run_bash
 
@@ -69,33 +69,50 @@ def log_result(commit: str, decision: ExperimentDecision, description: str):
     print(f"[logged] {status} | bpb={val_bpb_str} | {description}")
 
 
-def run_agent():
-    program = open("program.md").read()
-
-    messages = [
+def make_messages(program: str, context: str) -> list:
+    # fresh message list every experiment — no tool call history to worry about
+    return [
         SystemMessage(content=program),
         HumanMessage(content=(
             "Setup is already done. Branch is created, results.tsv is initialized. "
-            "Skip setup and go straight to the experiment loop. "
-            "For each experiment: read the current state, make a code change, commit, "
-            "then run: run_bash('uv run train.py > run.log 2>&1'). "
-            "When the run finishes, tell me: "
+            "Here is the current context from previous experiments:\n\n"
+            f"{context}\n\n"
+            "Now run the next experiment: read train.py and results.tsv, make one focused "
+            "code change, commit it, then run: run_bash('uv run train.py > run.log 2>&1'). "
+            "When done, tell me: "
             "1) the git commit hash (run 'git rev-parse --short HEAD') "
             "2) a short description of what you changed "
-            "3) the full contents of run.log "
+            "3) the full contents of run.log. "
             "Then stop and wait."
         )),
     ]
 
+
+def run_agent():
+    program = open("program.md").read()
+    last_decision = None
     iteration = 0
 
     while True:
         iteration += 1
         print(f"\n{'='*60}\nExperiment #{iteration}\n{'='*60}")
 
-        # let the agent keep calling tools until it's done with the experiment
+        # build context summary from last decision to carry forward
+        if last_decision:
+            context = (
+                f"Last experiment: {last_decision.reason} "
+                f"(keep={last_decision.keep}, bpb={last_decision.val_bpb:.6f}). "
+                f"Suggested next idea: {last_decision.next_idea}"
+            )
+        else:
+            context = "This is the first experiment. Start by reading results.tsv and train.py."
+
+        # fresh message list each experiment
+        messages = make_messages(program, context)
+
+        # let the agent keep calling tools until it's done
         while True:
-            response = agent_llm.invoke(messages, config={"configurable": {"tool_choice": "auto"}})
+            response = agent_llm.invoke(messages)
             messages.append(response)
             if response.tool_calls:
                 messages.extend(execute_tool_calls(response))
@@ -127,17 +144,7 @@ def run_agent():
             run_bash.invoke({"cmd": "git reset --hard HEAD~1"})
 
         log_result(commit, decision, description)
-
-        messages.append(HumanMessage(content=(
-            f"Decision: {'KEEP' if decision.keep else 'DISCARD'}. "
-            f"Reason: {decision.reason} "
-            f"Next idea: {decision.next_idea} "
-            f"Continue the loop."
-        )))
-
-        # always keep the system prompt and kickoff message, trim everything else
-        if len(messages) > 32:
-            messages = messages[:2] + messages[-30:]
+        last_decision = decision
 
 
 if __name__ == "__main__":
