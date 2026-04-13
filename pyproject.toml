@@ -1,0 +1,32 @@
+[project]
+name = "langchain-deep-agents"
+version = "0.1.0"
+description = "Autonomous LLM training research powered by LangChain Deep Agents"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "deepagents>=0.5.0",
+    "langchain-openai>=0.3.0",
+    "numpy>=2.2.6",
+    "pyarrow>=21.0.0",
+    "python-dotenv>=1.0.0",
+    "requests>=2.32.0",
+    "rustbpe>=0.1.0",
+    "tiktoken>=0.11.0",
+    "torch>=2.6.0",
+]
+
+[project.optional-dependencies]
+cuda = [
+    "kernels>=0.11.7",
+]
+
+[tool.uv.sources]
+torch = [
+    { index = "pytorch-cu128", marker = "sys_platform == 'linux'" },
+]
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
