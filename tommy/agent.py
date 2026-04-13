@@ -1,7 +1,8 @@
 import re
 from pydantic import BaseModel
-from langchain_openai import ChatOpenAI
-from langchain_core.messages import SystemMessage, HumanMessage, ToolMessage, AIMessage
+from langchain.chat_models import init_chat_model
+from langchain_core.messages import HumanMessage
+from deepagents import create_deep_agent
 
 from tools import read_file, edit_file, run_bash
 
@@ -15,21 +16,8 @@ class ExperimentDecision(BaseModel):
     next_idea: str
 
 
-# two separate models — agent does the work, judge makes the call
-agent_llm = ChatOpenAI(model="gpt-4o", max_tokens=8192)
-judge_llm = ChatOpenAI(model="gpt-4o", max_tokens=1024).with_structured_output(ExperimentDecision)
-
-TOOLS = [read_file, edit_file, run_bash]
-TOOL_MAP = {t.name: t for t in TOOLS}
-agent_llm = agent_llm.bind_tools(TOOLS)
-
-
-def execute_tool_calls(response) -> list:
-    tool_messages = []
-    for tc in response.tool_calls:
-        result = TOOL_MAP[tc["name"]].invoke(tc["args"])
-        tool_messages.append(ToolMessage(content=str(result), tool_call_id=tc["id"]))
-    return tool_messages
+# judge is a plain chat model with structured output — no tools needed
+judge_llm = init_chat_model("openai:gpt-4o").with_structured_output(ExperimentDecision)
 
 
 def make_decision(run_log: str, description: str) -> ExperimentDecision:
@@ -69,35 +57,22 @@ def log_result(commit: str, decision: ExperimentDecision, description: str):
     print(f"[logged] {status} | bpb={val_bpb_str} | {description}")
 
 
-def make_messages(program: str, context: str) -> list:
-    # fresh message list every experiment — no tool call history to worry about
-    return [
-        SystemMessage(content=program),
-        HumanMessage(content=(
-            "Setup is already done. Branch is created, results.tsv is initialized. "
-            "Here is the current context from previous experiments:\n\n"
-            f"{context}\n\n"
-            "Now run the next experiment: read train.py and results.tsv, make one focused "
-            "code change, commit it, then run: run_bash('uv run train.py > run.log 2>&1'). "
-            "When done, tell me: "
-            "1) the git commit hash (run 'git rev-parse --short HEAD') "
-            "2) a short description of what you changed "
-            "3) the full contents of run.log. "
-            "Then stop and wait."
-        )),
-    ]
-
-
 def run_agent():
     program = open("program.md").read()
     last_decision = None
     iteration = 0
 
+    # create_deep_agent gives us planning, context management, and file system built in
+    agent = create_deep_agent(
+        model=init_chat_model("openai:gpt-4o"),
+        tools=[read_file, edit_file, run_bash],
+        system_prompt=program,
+    )
+
     while True:
         iteration += 1
         print(f"\n{'='*60}\nExperiment #{iteration}\n{'='*60}")
 
-        # build context summary from last decision to carry forward
         if last_decision:
             context = (
                 f"Last experiment: {last_decision.reason} "
@@ -107,24 +82,27 @@ def run_agent():
         else:
             context = "This is the first experiment. Start by reading results.tsv and train.py."
 
-        # fresh message list each experiment
-        messages = make_messages(program, context)
+        result = agent.invoke({
+            "messages": [HumanMessage(content=(
+                "Setup is already done. Branch is created, results.tsv is initialized. "
+                "Skip setup and run the next experiment. "
+                f"Context from last run: {context}\n\n"
+                "Make one focused change to train.py, commit it, then run: "
+                "run_bash('uv run train.py > run.log 2>&1'). "
+                "When done tell me: "
+                "1) git commit hash (run 'git rev-parse --short HEAD') "
+                "2) short description of what you changed "
+                "3) full contents of run.log. "
+                "Then stop."
+            ))]
+        })
 
-        # let the agent keep calling tools until it's done
-        while True:
-            response = agent_llm.invoke(messages)
-            messages.append(response)
-            if response.tool_calls:
-                messages.extend(execute_tool_calls(response))
-            else:
-                break
-
-        summary = response.content if isinstance(response.content, str) else str(response.content)
+        summary = result["messages"][-1].content
 
         commit_match = re.search(r'\b([0-9a-f]{7})\b', summary)
         commit = commit_match.group(1) if commit_match else "unknown"
 
-        # prefer reading run.log directly over parsing the agent's summary
+        # prefer reading run.log directly over parsing the agent summary
         try:
             run_log = open("run.log").read()
         except FileNotFoundError:
