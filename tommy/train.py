@@ -461,7 +461,11 @@ device = torch.device("cuda")
 autocast_ctx = torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16)
 H100_BF16_PEAK_FLOPS = 989.5e12
 
-tokenizer = Tokenizer.from_directory()
+try:
+    tokenizer = Tokenizer.from_directory()
+except FileNotFoundError as e:
+    print(f"Tokenizer file not found: {e}")
+    exit(1)
 vocab_size = tokenizer.get_vocab_size()
 print(f"Vocab size: {vocab_size:,}")
 
