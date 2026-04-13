@@ -29,7 +29,7 @@ from prepare import MAX_SEQ_LEN, TIME_BUDGET, Tokenizer, make_dataloader, evalua
 class GPTConfig:
     sequence_len: int = 2048
     vocab_size: int = 32768
-    n_layer: int = 8
+    n_layer: int = 6
     n_head: int = 6
     n_kv_head: int = 6
     n_embd: int = 512
