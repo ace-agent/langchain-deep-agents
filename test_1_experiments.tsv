@@ -1,0 +1,75 @@
+iteration	commit	time_us	status	description
+1	HEAD	685.00	keep	Implemented Triton two-pass reduction kernel with configurable BLOCK_SIZE
+2	HEAD	686.00	discard	Tuned Triton kernel with BLOCK_SIZE=8192 and NUM_WARPS=4
+3	HEAD	685.00	discard	Implemented inline CUDA kernel with warp shuffle and vectorized loads
+4	HEAD	699.00	discard	Implemented inline CUDA kernel with CUB library for optimized reduction
+5	HEAD	688.00	discard	Implemented grid-stride loops with larger BLOCK_SIZE for improved parallelism
+6	HEAD	701.00	discard	Implemented Triton two-pass reduction kernel for vector sum optimization
+7	2b2ebdb	663.00	keep	Implemented grid-stride loop with Triton kernel optimization
+8	2b2ebdb	665.00	discard	Implemented Warp shuffle for further optimization
+9	2b2ebdb	663.00	keep	Implemented CUB BlockReduce for optimized reduction
+10	2b2ebdb	665.00	discard	Implemented vectorized memory loads using CUDA
+11	2b2ebdb	664.00	discard	Implemented grid-stride loop for better parallelism
+12	2b2ebdb	686.00	discard	Implemented warp shuffle with block reduction
+13	2b2ebdb	686.00	discard	Implemented block vectorization for optimized reduction
+14	2b2ebdb	686.00	discard	Experiment with smaller block size for optimization
+15	2b2ebdb	686.00	discard	Combined block reduction with shared memory optimization
+16	HEAD	0.00	crash	Implemented coalesced memory access for optimized reduction
+17	HEAD	0.00	crash	Simplified kernel logic focusing on basic memory access pattern
+18	HEAD	0.00	crash	Recreated submission.py using Triton for efficient reduction
+19	HEAD	60.30	keep	Optimized block size to 256 and used cooperative groups for better warp shuffle efficiency.
+20	HEAD	60.40	discard	Improved memory access pattern using float4 vectorized loads for better coalescence.
+21	c3fd65c	0.00	crash	Replace broken CUB-based kernel with correct two-stage warp-shuffle reduction fully in CUDA (avoid P
+22	f30fde5	0.00	crash	Switch from load_inline extension (flagged as using another stream) to pure Triton 2-pass reduction,
+23	7559044	0.00	crash	Avoid custom extensions/Triton/extra allocations and do a single PyTorch reduction, hoping evaluator
+24	8feb81d	0.00	crash	Wrap torch.sum in torch.cuda.stream(torch.cuda.current_stream()) to ensure all work is enqueued on t
+25	8505d4c	0.00	crash	Use CUDA graph capture and replay on current stream to prevent any stream switching and reduce launc
+26	ddcbcaa	0.00	crash	Probe whether 'other stream' rejection occurs even with no CUDA work. If still rejected, issue is no
+27	9887a79	0.00	crash	Attempted next experiment but blocked by leaderboard rate limit; no new timing available.
+28	9887a79	0.00	crash	Run in --mode test while rate-limited to get more diagnostics. Found load_inline binding is wrong: f
+29	101a7a3	0.00	crash	Fix extension build correctness (provide C++ wrapper + pybind) so we can isolate the 'other stream'
+30	9887a79	0.00	crash	Continue loop with next experiment submission; blocked by rate limit again.
+31	HEAD	0.00	crash	Switch to a more efficient 2-pass reduction: custom CUDA kernel for partial sums using warp shuffles
+32	HEAD	0.00	crash	Testing increased threads per block (1024) and vectorized memory access using float4 for better perf
+33	HEAD	158.00	keep	Optimizing shared memory usage and warp-level reductions to improve execution time by reducing atomi
+34	HEAD	158.00	discard	Incorporating double buffering and advanced tiling techniques using Triton to optimize matrix multip
+35	HEAD	123.00	keep	Utilizing CUDA Tensor Core APIs (wmma) optimizes float16 matrix multiplication by harnessing hardwar
+36	HEAD	123.00	keep	Further aligning the kernel implementations and harmonizing calls with advanced operations using hal
+37	HEAD	121.00	keep	Utilizing refined shared memory allocations and load balancing strategies to further optimize matrix
+38	HEAD	0.00	crash	Implement synchronous memory engagement enhancing kernel parallelism tactics, leveraging shared memo
+39	HEAD	0.00	crash	Precise alignment of tiles and shared memory access patterns improve matrix multiplication throughpu
+40	HEAD	0.00	crash	Refining memory access and thread block alignment should improve overall performance in matrix multi
+41	HEAD	0.00	crash	Reassessing shared memory allocations and parallel executions will yield improved stability and perf
+42	HEAD	0.00	crash	Revisiting structured matrix multiplication will leverage Tensor Core functionality to optimize the
+43	HEAD	0.00	crash	Refining the kernel further to ensure optimized use of CUDA's Tensor Core operations with better syn
+44	HEAD	0.00	crash	Readdress execution flow for reliability in utilization of Tensor Core instructions with hardware-al
+45	HEAD	0.00	crash	Attempt stability with synchronization tweak and reduced recurrence, aiming to prevent crashes throu
+46	HEAD	0.00	crash	Focus on accurate resource handling with improved matrix alignment.
+47	HEAD	0.00	crash	Introduce fine-grained control over warp synchronization through shared memory barriers.
+48	HEAD	0.00	crash	Re-attempt with ultra-streamlined synchronization and step-by-step accumulation that captures inter-
+49	HEAD	0.00	crash	Attempt simplification: narrow scope to data-parallelism across threads within warps, eliminating co
+50	HEAD	0.00	crash	Rectify integrity of load/store sequence captured through tightly-coupled synchronization checkpoint
+51	HEAD	0.00	crash	Further refine CUDA kernel by isolating warp-lane execution using tighter synchronization and barrie
+52	HEAD	0.00	crash	Align matrix multiplication by implementing warp size control, synchronize using warp-level barriers
+53	HEAD	0.00	keep	Implement blocked convolution approach instead of simple matmul for improved performance.
+54	HEAD	0.00	discard	Implement blocked convolution approach instead of simple matmul for improved performance.
+55	HEAD	0.00	pending	Utilize mixed precision to balance accuracy and performance.
+56	HEAD	0.00	pending	Utilize mixed precision to enhance performance by balancing numeric accuracy and algorithmic efficie
+57	HEAD	109.00	keep	Refining synchronization and optimizing precision using reduced barriers and enhanced memory allocat
+58	HEAD	109.00	keep	Experimenting with 3D grid dimensions to optimize kernel execution further.
+59	HEAD	109.00	keep	Wider block dimensions for enhanced parallelism and throughput.
+60	HEAD	109.00	keep	Experiment with loop unrolling to leverage unrolled loops for enhanced kernel performance.
+61	HEAD	109.00	keep	Ensure float to half conversion accuracy in fragment initialization.
+62	HEAD	109.00	keep	Using fast math for enhanced efficiency in computation.
+63	HEAD	0.00	crash	Further optimizing warp-level parallelism and fine-tuning block dimensions for potential performance
+64	HEAD	0.00	crash	Larger block dimensions to increase thread workload, utilize shared memory better, and reduce synchr
+65	HEAD	0.00	crash	Refine memory coalescing and optimize sync patterns at previously successful block dimensions for im
+66	HEAD	0.00	crash	Revert block size to previously successful scalar (16x16), and enforce memory coalescing.
+67	HEAD	0.00	crash	Intermediary block size (32x8) for balanced load; more effective shared memory tiling for matrix chu
+68	HEAD	0.00	crash	Simplicity in 16x16 configuration due to inherent Tensor Core stability; ensuring accurate shared me
+69	HEAD	0.00	crash	Experiment with larger block dimensions to accommodate more work, expecting improved parallelism and
+70	HEAD	109.40	discard	Adjusting the grid and block dimensions to 32x32 to optimize the number of threads and better load b
+71	HEAD	109.20	discard	Apply loop unrolling within the computation loop to reduce overhead and enhance kernel performance.
+72	HEAD	108.70	keep	Using a larger 32x32 shared memory block size and cleaning up redundant declarations will improve me
+73	HEAD	108.30	keep	Increasing the unrolling factor in the loop may improve memory access efficiency and enhance perform
+74	HEAD	107.80	keep	Adjusting warp calculations in kernel to fit new 32x32 grid can improve stride and reduce latency.

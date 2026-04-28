@@ -1,40 +1,28 @@
 import torch
-from torch.utils.cpp_extension import load_inline
 from task import input_t, output_t
 
-cuda_src = r"""
-#include <cuda_runtime.h>
-__global__ void sum_reduce(const float* input, float* output, int n) {
-    __shared__ float sdata[256];
-    int tid = threadIdx.x;
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    float mySum = (i < n) ? input[i] : 0.0f;
-    sdata[tid] = mySum;
-    __syncthreads();
-    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
-        if (tid < s) sdata[tid] += sdata[tid + s];
-        __syncthreads();
-    }
-    if (tid == 0) output[blockIdx.x] = sdata[0];
-}
-"""
 
-cpp_src = "torch::Tensor launch_sum(torch::Tensor input);"
+def generate_input(m: int, n: int, k: int, seed: int) -> input_t:
+    gen = torch.Generator(device='cuda')
+    gen.manual_seed(seed)
+    a = torch.empty(m, k, device='cuda', dtype=torch.float16)
+    a.uniform_(0, 1, generator=gen)
+    b = torch.empty(k, n, device='cuda', dtype=torch.float16)
+    b.uniform_(0, 1, generator=gen)
+    c = torch.empty(m, n, device='cuda', dtype=torch.float16)
+    return a, b, c
 
-_module = load_inline(
-    name='vectorsum_cuda',
-    cpp_sources=cpp_src,
-    cuda_sources=cuda_src,
-    functions=['sum_reduce'],
-    verbose=False,
-)
+
+def ref_kernel(data: input_t) -> output_t:
+    """Reference implementation using PyTorch's optimized matmul."""
+    a, b, c = data
+    return a @ b
+
 
 def custom_kernel(data: input_t) -> output_t:
-    input_tensor, output_tensor = data
-    n = input_tensor.numel()
-    threads = 256
-    blocks = (n + threads - 1) // threads
-    partial = torch.zeros(blocks, device=input_tensor.device, dtype=input_tensor.dtype)
-    _module.sum_reduce(input_tensor, partial, n)
-    output_tensor[0] = partial.sum()
-    return output_tensor
+    """
+    Custom kernel implementation - starts as copy of reference.
+    The agent will optimize this function to beat PyTorch's cuBLAS performance.
+    """
+    a, b, c = data
+    return a @ b
