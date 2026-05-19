@@ -107,7 +107,7 @@ def read_results_summary() -> str:
 def build_agent():
     load_dotenv()
 
-    model_name = os.environ.get("AUTORESEARCH_MODEL", "gpt-4o")
+    model_name = os.environ.get("AUTORESEARCH_MODEL", "gpt-5.2")
     system_prompt = load_system_prompt()
     checkpointer = MemorySaver()
 
@@ -129,11 +129,13 @@ def build_agent():
         if key in os.environ:
             env[key] = os.environ[key]
 
+    # Use virtual_mode=True to restrict filesystem access to the project directory
+    # This prevents the grep tool from scanning system directories like /proc
     agent = create_deep_agent(
         model=model,
         tools=[log_experiment, get_experiment_history],
         system_prompt=system_prompt,
-        backend=LocalShellBackend(root_dir=PROJECT_DIR, virtual_mode=False, env=env),
+        backend=LocalShellBackend(root_dir=PROJECT_DIR, virtual_mode=True, env=env),
         checkpointer=checkpointer,
     )
     return agent
@@ -202,7 +204,7 @@ def main():
 
     # Create timestamped run directory
     gpu_target = os.environ.get("GPU_TARGET", "B200")
-    leaderboard = os.environ.get("LEADERBOARD", "matmul_v2")
+    leaderboard = os.environ.get("LEADERBOARD", "nvfp4_group_gemm")
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
     run_name = f"{timestamp}_{gpu_target}_{leaderboard}"
     run_dir = os.path.join(PROJECT_DIR, "runs", run_name)
@@ -216,7 +218,7 @@ def main():
 
     agent = build_agent()
 
-    model_name = os.environ.get("AUTORESEARCH_MODEL", "gpt-4o")
+    model_name = os.environ.get("AUTORESEARCH_MODEL", "gpt-5.2")
     starting_iteration = _get_next_iteration() - 1
 
     print(f"Starting kernel optimization agent...")
@@ -234,7 +236,9 @@ def main():
 
     kickoff_message = (
         "Read program.md for full instructions. Then call get_experiment_history "
-        "to review any prior attempts. Read the current submission.py. "
+        "to review any prior attempts. Read the current submission.py — it contains "
+        "an expert-written Blackwell PTX kernel using tcgen05 MMA, TMA, and CTA clustering. "
+        "Your first step should be to benchmark it as-is to establish a baseline. "
         "Then begin the autonomous optimization loop: propose a hypothesis, "
         "implement it, submit, log the result, and repeat.\n\n"
         + read_results_summary()

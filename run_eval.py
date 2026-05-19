@@ -16,10 +16,6 @@ import modal
 
 
 def format_results_markdown(res: dict, mode: str = "leaderboard") -> str:
-    """
-    Convert the structured dict returned by evaluate_kernel into the same
-    human-readable markdown string that popcorn-cli wrote to results.json.
-    """
     gpu = res.get("gpu_name", "NVIDIA B200")
     torch_ver = res.get("torch_version", "unknown")
     plat = res.get("platform", "unknown")
@@ -58,7 +54,7 @@ def format_results_markdown(res: dict, mode: str = "leaderboard") -> str:
     lines.append("```")
     for td in res["test_details"]:
         icon = "✅" if td["passed"] else "❌"
-        lines.append(f"{icon} k: {td['k']}; m: {td['m']}; n: {td['n']}; seed: {td['seed']}")
+        lines.append(f"{icon} g: {td['g']}; m: {td['m']}; n: {td['n']}; k: {td['k']}")
     lines.append("```")
 
     if res.get("error") and not res["success"]:
@@ -73,9 +69,14 @@ def format_results_markdown(res: dict, mode: str = "leaderboard") -> str:
         lines.append("")
         lines.append("## Benchmarks:")
         lines.append("```")
-        lines.append(f"k: {bm['k']}; m: {bm['m']}; n: {bm['n']}; seed: {bm['seed']}")
-        lines.append(f" ⏱ {bm['mean_us']} ± {bm['stderr_us']} µs")
-        lines.append(f" ⚡ {bm['min_us']} µs 🐌 {bm['max_us']} µs")
+        lines.append(f"Geometric mean: ⏱ {bm['geomean_us']} µs")
+        lines.append("")
+        for bd in res.get("benchmark_details", []):
+            lines.append(
+                f"  Case {bd['case_idx']}: g={bd['g']} "
+                f"⏱ {bd['mean_us']} ± {bd['stderr_us']} µs "
+                f"⚡ {bd['min_us']} µs 🐌 {bd['max_us']} µs"
+            )
         lines.append("```")
 
     return "\n".join(lines)

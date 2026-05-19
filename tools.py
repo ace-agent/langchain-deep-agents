@@ -134,7 +134,8 @@ def _update_plot():
     ax.yaxis.set_major_formatter(ticker.FormatStrFormatter("%.0f"))
     ax.set_xlabel("Iteration", fontsize=12)
     ax.set_ylabel("Negative Latency (-μs)", fontsize=12)
-    ax.set_title("GPU MODE matmul_v2 — Autoresearch Progress", fontsize=14, fontweight="bold")
+    leaderboard = os.environ.get("LEADERBOARD", "nvfp4_group_gemm")
+    ax.set_title(f"GPU MODE {leaderboard} — Autoresearch Progress", fontsize=14, fontweight="bold")
     ax.legend(loc="upper right", framealpha=0.9)
     ax.grid(True, alpha=0.3)
 
@@ -204,6 +205,11 @@ def log_experiment(
         _update_plot()
     except Exception:
         pass
+
+    if status == "keep" and _run_directory and kernel_code.strip():
+        best_path = os.path.join(_run_directory, "best_submission.py")
+        with open(best_path, "w") as f:
+            f.write(kernel_code)
 
     if status == "crash":
         return f"Logged iteration #{iteration} CRASH: {hypothesis}"

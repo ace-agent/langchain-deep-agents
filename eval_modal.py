@@ -1,9 +1,9 @@
 """
-Modal app for evaluating CUDA kernels on a B200 GPU.
+Modal app for evaluating NVFP4 Group GEMM kernels on a B200 GPU.
 
 The remote function receives kernel source code as a string, dynamically loads
-it, runs correctness tests against the reference (a @ b), then benchmarks with
-warmup + timed iterations using CUDA events for precise measurement.
+it, runs correctness tests against the reference (torch._scaled_mm), then
+benchmarks with warmup + timed iterations using CUDA events.
 
 Returns a JSON string to avoid pickle/torch deserialization issues on the client.
 """
@@ -13,8 +13,17 @@ import modal
 app = modal.App("cuda-kernel-eval")
 
 gpu_image = (
-    modal.Image.debian_slim(python_version="3.11")
-    .pip_install("torch", "numpy", "triton")
+    modal.Image.from_registry(
+        "nvidia/cuda:12.8.1-devel-ubuntu24.04",
+        add_python="3.11",
+    )
+    .entrypoint([])
+    .apt_install("ninja-build")
+    .pip_install("torch", "numpy", "triton", "ninja")
+    .env({
+        "TORCH_CUDA_ARCH_LIST": "10.0a",
+        "CUDA_HOME": "/usr/local/cuda",
+    })
 )
 
 
@@ -24,11 +33,6 @@ def evaluate_kernel(
     warmup_iters: int = 5,
     eval_iters: int = 10,
 ) -> str:
-    """
-    Run correctness tests and benchmarks for a CUDA kernel on a B200.
-
-    Returns a JSON string to avoid requiring torch on the caller side.
-    """
     import torch
     import platform
     import math
@@ -41,30 +45,174 @@ def evaluate_kernel(
     import tempfile
     import os
 
-    CORRECTNESS_CASES = [
-        {"m": 64, "n": 64, "k": 64, "seed": 53124},
-        {"m": 128, "n": 128, "k": 128, "seed": 3321},
-        {"m": 256, "n": 256, "k": 256, "seed": 1200},
-        {"m": 32, "n": 512, "k": 32, "seed": 32523},
-        {"m": 64, "n": 1024, "k": 64, "seed": 4327},
-    ]
-    BENCHMARK_CASE = {"m": 4096, "n": 5120, "k": 4096, "seed": 123456}
+    sf_vec_size = 16
 
-    def generate_input(m, n, k, seed):
-        gen = torch.Generator(device="cuda")
-        gen.manual_seed(seed)
-        a = torch.empty(m, k, device="cuda", dtype=torch.float16)
-        a.uniform_(0, 1, generator=gen)
-        b = torch.empty(k, n, device="cuda", dtype=torch.float16)
-        b.uniform_(0, 1, generator=gen)
-        c = torch.empty(m, n, device="cuda", dtype=torch.float16)
-        return (a, b, c)
+    def ceil_div(a, b):
+        return (a + b - 1) // b
+
+    def _create_fp4_tensors(l, mn, k):
+        ref_i8 = torch.randint(255, size=(l, mn, k // 2), dtype=torch.uint8, device="cuda")
+        ref_i8 = ref_i8 & 0b1011_1011
+        return ref_i8.permute(1, 2, 0).view(torch.float4_e2m1fn_x2)
+
+    def create_reordered_scale_factor_tensor(l, mn, k, ref_f8_tensor):
+        sf_k = ceil_div(k, sf_vec_size)
+        atom_m = (32, 4)
+        atom_k = 4
+        mma_shape = (
+            l,
+            ceil_div(mn, atom_m[0] * atom_m[1]),
+            ceil_div(sf_k, atom_k),
+            atom_m[0],
+            atom_m[1],
+            atom_k,
+        )
+        mma_permute_order = (3, 4, 1, 5, 2, 0)
+        rand_int_tensor = torch.randint(1, 3, mma_shape, dtype=torch.int8, device='cuda')
+        reordered_f8_tensor = rand_int_tensor.to(dtype=torch.float8_e4m3fn)
+        reordered_f8_tensor = reordered_f8_tensor.permute(*mma_permute_order)
+
+        if ref_f8_tensor.device.type == 'cpu':
+            ref_f8_tensor = ref_f8_tensor.cuda()
+
+        i_idx = torch.arange(mn, device='cuda')
+        j_idx = torch.arange(sf_k, device='cuda')
+        b_idx = torch.arange(l, device='cuda')
+
+        i_grid, j_grid, b_grid = torch.meshgrid(i_idx, j_idx, b_idx, indexing='ij')
+
+        mm = i_grid // (atom_m[0] * atom_m[1])
+        mm32 = i_grid % atom_m[0]
+        mm4 = (i_grid % 128) // atom_m[0]
+        kk = j_grid // atom_k
+        kk4 = j_grid % atom_k
+
+        reordered_f8_tensor[mm32, mm4, mm, kk4, kk, b_grid] = ref_f8_tensor[i_grid, j_grid, b_grid]
+
+        return reordered_f8_tensor
+
+    def to_blocked(input_matrix):
+        rows, cols = input_matrix.shape
+        n_row_blocks = ceil_div(rows, 128)
+        n_col_blocks = ceil_div(cols, 4)
+        padded_rows = n_row_blocks * 128
+        padded_cols = n_col_blocks * 4
+        if padded_rows != rows or padded_cols != cols:
+            padded = torch.nn.functional.pad(
+                input_matrix,
+                (0, padded_cols - cols, 0, padded_rows - rows),
+                mode="constant", value=0,
+            )
+        else:
+            padded = input_matrix
+        blocks = padded.view(n_row_blocks, 128, n_col_blocks, 4).permute(0, 2, 1, 3)
+        rearranged = blocks.reshape(-1, 4, 32, 4).transpose(1, 2).reshape(-1, 32, 16)
+        return rearranged.flatten()
+
+    def generate_input(m_list, n_list, k_list, g, seed):
+        torch.manual_seed(seed)
+        abc_tensors = []
+        sfasfb_tensors = []
+        sfasfb_reordered_tensors = []
+        problem_sizes = []
+        l = 1
+        for group_idx in range(g):
+            mi, ni, ki = m_list[group_idx], n_list[group_idx], k_list[group_idx]
+            a_ref = _create_fp4_tensors(l, mi, ki)
+            b_ref = _create_fp4_tensors(l, ni, ki)
+            c_ref = torch.randn((l, mi, ni), dtype=torch.float16, device="cuda").permute(1, 2, 0)
+
+            sf_k = ceil_div(ki, sf_vec_size)
+            sfa_ref_cpu = torch.randint(1, 3, (l, mi, sf_k), dtype=torch.int8).to(
+                dtype=torch.float8_e4m3fn
+            ).permute(1, 2, 0)
+            sfb_ref_cpu = torch.randint(1, 3, (l, ni, sf_k), dtype=torch.int8).to(
+                dtype=torch.float8_e4m3fn
+            ).permute(1, 2, 0)
+
+            sfa_reordered = create_reordered_scale_factor_tensor(l, mi, ki, sfa_ref_cpu)
+            sfb_reordered = create_reordered_scale_factor_tensor(l, ni, ki, sfb_ref_cpu)
+
+            abc_tensors.append((a_ref, b_ref, c_ref))
+            sfasfb_tensors.append((sfa_ref_cpu, sfb_ref_cpu))
+            sfasfb_reordered_tensors.append((sfa_reordered, sfb_reordered))
+            problem_sizes.append((mi, ni, ki, l))
+        return (abc_tensors, sfasfb_tensors, sfasfb_reordered_tensors, problem_sizes)
+
+    def ref_kernel(data):
+        abc_tensors, sfasfb_tensors, _, problem_sizes = data
+        result_tensors = []
+        for i, ((a_ref, b_ref, c_ref), (sfa_ref, sfb_ref), (m, n, k, l)) in enumerate(
+            zip(abc_tensors, sfasfb_tensors, problem_sizes)
+        ):
+            for l_idx in range(l):
+                scale_a = to_blocked(sfa_ref[:, :, l_idx])
+                scale_b = to_blocked(sfb_ref[:, :, l_idx])
+                res = torch._scaled_mm(
+                    a_ref[:, :, l_idx].view(torch.float4_e2m1fn_x2),
+                    b_ref[:, :, l_idx].transpose(0, 1).view(torch.float4_e2m1fn_x2),
+                    scale_a.cuda(),
+                    scale_b.cuda(),
+                    bias=None,
+                    out_dtype=torch.float16,
+                )
+                c_ref[:, :, l_idx] = res
+            result_tensors.append(c_ref)
+        return result_tensors
+
+    CORRECTNESS_CASES = [
+        {"g": 2, "m": [128, 256], "n": [256, 256], "k": [256, 256], "seed": 42},
+        {"g": 2, "m": [128, 384], "n": [4096, 4096], "k": [1536, 1536], "seed": 100},
+        {"g": 2, "m": [192, 320], "n": [3072, 3072], "k": [4096, 4096], "seed": 200},
+    ]
+
+    BENCHMARK_CASES = [
+        {
+            "g": 8,
+            "m": [80, 176, 128, 72, 64, 248, 96, 160],
+            "n": [4096]*8,
+            "k": [7168]*8,
+            "seed": 1001,
+        },
+        {
+            "g": 8,
+            "m": [40, 76, 168, 72, 164, 148, 196, 160],
+            "n": [7168]*8,
+            "k": [2048]*8,
+            "seed": 1002,
+        },
+        {
+            "g": 2,
+            "m": [192, 320],
+            "n": [3072, 3072],
+            "k": [4096, 4096],
+            "seed": 1003,
+        },
+        {
+            "g": 2,
+            "m": [128, 384],
+            "n": [4096, 4096],
+            "k": [1536, 1536],
+            "seed": 1004,
+        },
+    ]
 
     def load_kernel(code):
         task_mod = types.ModuleType("task")
-        task_mod.input_t = tuple[torch.Tensor, torch.Tensor, torch.Tensor]
-        task_mod.output_t = torch.Tensor
+        task_mod.input_t = tuple
+        task_mod.output_t = list
         sys.modules["task"] = task_mod
+
+        utils_mod = types.ModuleType("utils")
+        def make_match_reference(ref_fn, rtol=1e-3, atol=1e-3):
+            def checker(output, expected):
+                for o, e in zip(output, expected):
+                    if not torch.allclose(o, e, rtol=rtol, atol=atol):
+                        return False
+                return True
+            return checker
+        utils_mod.make_match_reference = make_match_reference
+        sys.modules["utils"] = utils_mod
 
         tmp_dir = tempfile.mkdtemp()
         path = os.path.join(tmp_dir, "submission.py")
@@ -88,6 +236,7 @@ def evaluate_kernel(
         "tests_total": len(CORRECTNESS_CASES),
         "test_details": [],
         "benchmark": None,
+        "benchmark_details": [],
         "gpu_name": gpu_name,
         "torch_version": str(torch.__version__),
         "platform": platform.platform(),
@@ -101,24 +250,31 @@ def evaluate_kernel(
         return json.dumps(result)
 
     for case in CORRECTNESS_CASES:
-        m, n, k, seed = case["m"], case["n"], case["k"], case["seed"]
-        detail = {"m": m, "n": n, "k": k, "seed": seed, "passed": False, "error": None}
+        g = case["g"]
+        detail = {"g": g, "m": case["m"], "n": case["n"], "k": case["k"], "passed": False, "error": None}
         try:
-            data = generate_input(m, n, k, seed)
-            ref = data[0] @ data[1]
+            ref_data = generate_input(case["m"], case["n"], case["k"], g, case["seed"])
+            ref_out = ref_kernel(ref_data)
 
-            data2 = generate_input(m, n, k, seed)
-            out = custom_kernel(data2)
+            test_data = generate_input(case["m"], case["n"], case["k"], g, case["seed"])
+            custom_out = custom_kernel(test_data)
             torch.cuda.synchronize()
 
-            if torch.allclose(out, ref, atol=1e-1, rtol=1e-1):
+            all_match = True
+            max_diff = 0.0
+            for ref_c, cust_c in zip(ref_out, custom_out):
+                if not torch.allclose(ref_c, cust_c, atol=1e-1, rtol=1e-1):
+                    diff = (ref_c - cust_c).abs().max().item()
+                    max_diff = max(max_diff, diff)
+                    all_match = False
+
+            if all_match:
                 detail["passed"] = True
                 result["tests_passed"] += 1
             else:
-                max_diff = (out - ref).abs().max().item()
                 detail["error"] = f"Mismatch: max_diff={max_diff:.6f}"
         except Exception as e:
-            detail["error"] = str(e)
+            detail["error"] = f"{type(e).__name__}: {str(e)}"
 
         result["test_details"].append(detail)
 
@@ -131,46 +287,60 @@ def evaluate_kernel(
         return json.dumps(result)
 
     try:
-        bm = BENCHMARK_CASE
-        m, n, k, seed = bm["m"], bm["n"], bm["k"], bm["seed"]
+        case_times = []
 
-        for _ in range(warmup_iters):
-            data = generate_input(m, n, k, seed)
-            _ = custom_kernel(data)
-            torch.cuda.synchronize()
+        for bi, bcase in enumerate(BENCHMARK_CASES):
+            g = bcase["g"]
 
-        timings_us = []
-        for _ in range(eval_iters):
-            data = generate_input(m, n, k, seed)
+            for _ in range(warmup_iters):
+                data = generate_input(bcase["m"], bcase["n"], bcase["k"], g, bcase["seed"])
+                _ = custom_kernel(data)
+                torch.cuda.synchronize()
 
-            start_evt = torch.cuda.Event(enable_timing=True)
-            end_evt = torch.cuda.Event(enable_timing=True)
+            timings_us = []
+            for _ in range(eval_iters):
+                data = generate_input(bcase["m"], bcase["n"], bcase["k"], g, bcase["seed"])
+                torch.cuda.synchronize()
 
-            start_evt.record()
-            _ = custom_kernel(data)
-            end_evt.record()
-            torch.cuda.synchronize()
+                start_evt = torch.cuda.Event(enable_timing=True)
+                end_evt = torch.cuda.Event(enable_timing=True)
 
-            elapsed_ms = start_evt.elapsed_time(end_evt)
-            timings_us.append(elapsed_ms * 1000.0)
+                start_evt.record()
+                _ = custom_kernel(data)
+                end_evt.record()
+                torch.cuda.synchronize()
 
-        mean_us = sum(timings_us) / len(timings_us)
-        variance = sum((t - mean_us) ** 2 for t in timings_us) / len(timings_us)
-        std_us = math.sqrt(variance)
-        stderr_us = std_us / math.sqrt(len(timings_us))
-        min_us = min(timings_us)
-        max_us = max(timings_us)
+                elapsed_ms = start_evt.elapsed_time(end_evt)
+                timings_us.append(elapsed_ms * 1000.0)
+
+            mean_us = sum(timings_us) / len(timings_us)
+            variance = sum((t - mean_us) ** 2 for t in timings_us) / len(timings_us)
+            std_us = math.sqrt(variance)
+            stderr_us = std_us / math.sqrt(len(timings_us))
+            min_us = min(timings_us)
+            max_us = max(timings_us)
+
+            case_detail = {
+                "case_idx": bi,
+                "g": g,
+                "m": bcase["m"],
+                "n": bcase["n"],
+                "k": bcase["k"],
+                "mean_us": round(mean_us, 1),
+                "std_us": round(std_us, 2),
+                "stderr_us": round(stderr_us, 1),
+                "min_us": round(min_us, 1),
+                "max_us": round(max_us, 1),
+            }
+            result["benchmark_details"].append(case_detail)
+            case_times.append(mean_us)
+
+        geomean = math.exp(sum(math.log(t) for t in case_times) / len(case_times))
 
         result["benchmark"] = {
-            "m": m,
-            "n": n,
-            "k": k,
-            "seed": seed,
-            "mean_us": round(mean_us, 1),
-            "std_us": round(std_us, 2),
-            "stderr_us": round(stderr_us, 1),
-            "min_us": round(min_us, 1),
-            "max_us": round(max_us, 1),
+            "geomean_us": round(geomean, 1),
+            "case_times_us": [round(t, 1) for t in case_times],
+            "num_cases": len(case_times),
         }
         result["success"] = True
 
