@@ -27,10 +27,10 @@ gpu_image = (
 )
 
 
-@app.function(gpu="B200", image=gpu_image, timeout=600)
+@app.function(gpu="B200", image=gpu_image, timeout=600, min_containers=1)
 def evaluate_kernel(
     kernel_code: str,
-    warmup_iters: int = 10,
+    warmup_iters: int = 20,
     eval_iters: int = 50,
 ) -> str:
     import torch
