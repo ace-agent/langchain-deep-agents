@@ -54,7 +54,11 @@ def format_results_markdown(res: dict, mode: str = "leaderboard") -> str:
     lines.append("```")
     for td in res["test_details"]:
         icon = "✅" if td["passed"] else "❌"
-        lines.append(f"{icon} g: {td['g']}; m: {td['m']}; n: {td['n']}; k: {td['k']}")
+        g = td.get("g", "?")
+        err_suffix = ""
+        if td.get("error"):
+            err_suffix = f" — {td['error']}"
+        lines.append(f"{icon} g: {g}; m: {td['m']}; n: {td['n']}; k: {td['k']}{err_suffix}")
     lines.append("```")
 
     if res.get("error") and not res["success"]:
@@ -69,14 +73,34 @@ def format_results_markdown(res: dict, mode: str = "leaderboard") -> str:
         lines.append("")
         lines.append("## Benchmarks:")
         lines.append("```")
-        lines.append(f"Geometric mean: ⏱ {bm['geomean_us']} µs")
+        geomean_median = bm.get('geomean_median_us')
+        if geomean_median:
+            lines.append(f"Geometric mean: ⏱ {bm['geomean_us']} µs (median: {geomean_median} µs)")
+        else:
+            lines.append(f"Geometric mean: ⏱ {bm['geomean_us']} µs")
         lines.append("")
         for bd in res.get("benchmark_details", []):
-            lines.append(
-                f"  Case {bd['case_idx']}: g={bd['g']} "
-                f"⏱ {bd['mean_us']} ± {bd['stderr_us']} µs "
-                f"⚡ {bd['min_us']} µs 🐌 {bd['max_us']} µs"
-            )
+            g = bd.get('g', '?')
+            median = bd.get('median_us')
+            if median:
+                lines.append(
+                    f"  Case {bd['case_idx']}: g={g} "
+                    f"⏱ {bd['mean_us']} µs (median: {median} µs) "
+                    f"± {bd['stderr_us']} µs"
+                )
+            else:
+                lines.append(
+                    f"  Case {bd['case_idx']}: g={g} "
+                    f"⏱ {bd['mean_us']} ± {bd['stderr_us']} µs "
+                    f"⚡ {bd['min_us']} µs 🐌 {bd['max_us']} µs"
+                )
+            p10 = bd.get('p10_us')
+            p90 = bd.get('p90_us')
+            if p10 and p90:
+                lines.append(
+                    f"    Range: ⚡ {bd['min_us']} µs → 🐌 {bd['max_us']} µs "
+                    f"(p10: {p10}, p90: {p90})"
+                )
         lines.append("```")
 
     return "\n".join(lines)
@@ -103,14 +127,33 @@ def main():
 
     print(f"Submitting {args.submission} to Modal B200 ({args.mode} mode)...")
 
-    evaluate_kernel = modal.Function.from_name("cuda-kernel-eval", "evaluate_kernel")
+    try:
+        evaluate_kernel = modal.Function.from_name("cuda-kernel-eval", "evaluate_kernel")
 
-    if args.mode == "test":
-        raw = evaluate_kernel.remote(kernel_code, warmup_iters=0, eval_iters=0)
-    else:
-        raw = evaluate_kernel.remote(kernel_code)
+        if args.mode == "test":
+            raw = evaluate_kernel.remote(kernel_code, warmup_iters=0, eval_iters=0)
+        else:
+            raw = evaluate_kernel.remote(kernel_code)
 
-    res = json.loads(raw)
+        res = json.loads(raw)
+    except Exception as e:
+        # Modal itself crashed (timeout, OOM, network error, etc.)
+        # Write a parseable error so the agent can read results.json
+        import traceback
+        error_tb = traceback.format_exc()
+        res = {
+            "success": False,
+            "tests_passed": 0,
+            "tests_total": 0,
+            "test_details": [],
+            "benchmark": None,
+            "benchmark_details": [],
+            "gpu_name": "NVIDIA B200",
+            "torch_version": "unknown",
+            "platform": "unknown",
+            "error": f"Modal execution failed ({type(e).__name__}): {e}\n\n{error_tb}",
+        }
+
     md = format_results_markdown(res, mode=args.mode)
     with open(args.output, "w") as f:
         json.dump(md, f)

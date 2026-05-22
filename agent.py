@@ -1,38 +1,32 @@
 """
 CUDA kernel optimization agent powered by LangChain Deep Agents.
 
-Runs autoresearch for X iterations, checkpointing every Y iterations to
-measure whether the optimization loop is actually improving performance.
+Stateless autoresearch loop: each iteration spawns a fresh agent with no
+conversation history. State is persisted on disk (experiment_history.md,
+results.tsv, submission.py) and the agent reads it via tools each cycle.
 
 Usage:
-    uv run agent.py                           # default: 50 iterations, checkpoint every 5
-    uv run agent.py --iterations 100          # 100 iterations
-    uv run agent.py --checkpoint-every 10     # benchmark every 10 iterations
-    uv run agent.py --iterations 100 --checkpoint-every 10
-
-The agent autonomously modifies submission.py, submits to the leaderboard,
-and tracks results in experiment_history.md. All prior results and exploration
-traces are fed back to the agent at each iteration.
+    uv run agent.py                           # default: unlimited iterations, checkpoint every 5
+    uv run agent.py --iterations 100          # stop after 100 iterations
+    uv run agent.py --checkpoint-every 10     # print summary every 10 iterations
 """
 
 import argparse
-import json
 import os
 import sys
 import time
+import traceback
 from datetime import datetime, timezone
 from dotenv import load_dotenv
 
 from deepagents import create_deep_agent
 from deepagents.backends import LocalShellBackend
 from langchain_openai import ChatOpenAI
-from langgraph.checkpoint.memory import MemorySaver
 
+import tools
 from tools import (
     log_experiment,
     get_experiment_history,
-    TSV_FILE,
-    PLOT_FILE,
     _update_plot,
     _get_next_iteration,
     set_run_directory,
@@ -48,10 +42,10 @@ def load_system_prompt() -> str:
 
 def read_results_summary() -> str:
     """Build a concise summary of all experiments so far for the agent context."""
-    if not os.path.exists(TSV_FILE):
+    if not os.path.exists(tools.TSV_FILE):
         return "No experiments run yet."
 
-    with open(TSV_FILE) as f:
+    with open(tools.TSV_FILE) as f:
         lines = f.readlines()
 
     if len(lines) < 2:
@@ -105,17 +99,17 @@ def read_results_summary() -> str:
 
 
 def build_agent():
+    """Build a fresh agent instance (no checkpointer — stateless per iteration)."""
     load_dotenv()
 
     model_name = os.environ.get("AUTORESEARCH_MODEL", "gpt-5.2")
     system_prompt = load_system_prompt()
-    checkpointer = MemorySaver()
 
     model = ChatOpenAI(
         model=model_name,
         use_responses_api=False,
-        timeout=120,
-        max_retries=2,
+        timeout=180,
+        max_retries=3,
     )
 
     venv_path = os.path.join(PROJECT_DIR, ".venv", "bin")
@@ -129,16 +123,93 @@ def build_agent():
         if key in os.environ:
             env[key] = os.environ[key]
 
-    # Use virtual_mode=True to restrict filesystem access to the project directory
-    # This prevents the grep tool from scanning system directories like /proc
     agent = create_deep_agent(
         model=model,
         tools=[log_experiment, get_experiment_history],
         system_prompt=system_prompt,
         backend=LocalShellBackend(root_dir=PROJECT_DIR, virtual_mode=True, env=env),
-        checkpointer=checkpointer,
     )
     return agent
+
+
+def log_conversation(run_dir: str, iteration: int, prompt: str, response: str) -> None:
+    """Log the full conversation for each iteration for debugging."""
+    conversation_log = os.path.join(run_dir, "conversation_log.md")
+    timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    
+    with open(conversation_log, "a") as f:
+        f.write(f"\n## Iteration {iteration} — {timestamp}\n\n")
+        f.write("### Prompt:\n")
+        f.write(f"```\n{prompt}\n```\n\n")
+        f.write("### Response:\n")
+        f.write(f"```\n{response}\n```\n\n")
+        f.write("---\n")
+
+
+def build_iteration_prompt(iteration: int, total_iterations: int, run_dir: str) -> str:
+    """Build the single prompt the agent sees each iteration.
+
+    The agent has no memory — it must reconstruct context from disk.
+    We give it a concise summary in the prompt and tell it to use
+    get_experiment_history + grep on experiment_history.md for details.
+
+    The agent works on a COPY of submission.py inside the run directory,
+    never touching the original.
+    """
+    results_summary = read_results_summary()
+    is_first = iteration == 1
+
+    # Agent sees paths relative to PROJECT_DIR (its root_dir)
+    run_name = os.path.basename(run_dir)
+    sub = f"runs/{run_name}/submission.py"
+    results = f"runs/{run_name}/results.json"
+    best = f"runs/{run_name}/best_submission.py"
+    history = f"runs/{run_name}/experiment_history.md"
+
+    if is_first:
+        return (
+            f"Iteration {iteration}/{total_iterations}.\n\n"
+            "THIS IS THE FIRST ITERATION. YOU MUST ESTABLISH A BASELINE.\n\n"
+            f"DO NOT MODIFY {sub}. DO NOT change ANY code.\n\n"
+            "Execute these steps EXACTLY:\n"
+            f"1. Read {sub} (just to capture its content for logging)\n"
+            f"2. Run: python run_eval.py {sub} -o {results}\n"
+            f"3. Read {results} to get the geomean timing\n"
+            "4. Call log_experiment with:\n"
+            f"   - kernel_code = the full content of {sub}\n"
+            "   - hypothesis = 'Baseline test of expert kernel'\n"
+            "   - time_us = the geomean time from results.json\n"
+            "   - status = 'keep'\n\n"
+            f"CRITICAL: Do NOT edit, modify, or change {sub} in any way.\n"
+            "The purpose of this iteration is ONLY to measure current performance."
+        )
+
+    prior_context = ""
+    if "No experiments run yet" not in results_summary:
+        prior_context = f"\nCurrent experiment status:\n{results_summary}\n"
+
+    return (
+        f"Iteration {iteration}/{total_iterations}.\n"
+        f"{prior_context}\n"
+        f"WORKING FILE: {sub}\n"
+        f"RESULTS FILE: {results}\n\n"
+        "Instructions for this iteration:\n"
+        "1. Call get_experiment_history to review the last few experiments "
+        f"(hypotheses, results, what crashed). For older history, use grep on "
+        f"{history}.\n"
+        f"2. Read the current {sub}\n"
+        "3. Based on what worked/failed before, form a NEW hypothesis\n"
+        f"4. Implement ONE change to {sub}\n"
+        f"5. Run `python run_eval.py {sub} -o {results}`\n"
+        f"6. Read {results} and call log_experiment with the result\n\n"
+        "RULES:\n"
+        "- Make exactly ONE experiment per iteration\n"
+        f"- If the result is worse than the best, revert {sub} to the best version "
+        f"(copy from {best})\n"
+        "- Do NOT repeat approaches that already crashed or produced worse results\n"
+        f"- ONLY edit {sub} — do NOT modify any other files\n"
+        "- Do NOT ask for instructions or summarize — just act"
+    )
 
 
 def print_checkpoint(iteration: int, total_iterations: int, start_time: float):
@@ -157,7 +228,7 @@ def print_checkpoint(iteration: int, total_iterations: int, start_time: float):
 
     try:
         _update_plot()
-        print(f"  Plot updated: {PLOT_FILE}")
+        print(f"  Plot updated: {tools.PLOT_FILE}")
     except Exception as e:
         print(f"  Plot update failed: {e}")
 
@@ -181,7 +252,7 @@ def print_final_report(total_iterations: int, actual_iterations: int, start_time
 
     try:
         _update_plot()
-        print(f"  Final plot saved to: {PLOT_FILE}")
+        print(f"  Final plot saved to: {tools.PLOT_FILE}")
     except Exception:
         pass
 
@@ -189,9 +260,9 @@ def print_final_report(total_iterations: int, actual_iterations: int, start_time
 
 
 def main():
-    parser = argparse.ArgumentParser(description="GPU MODE Autoresearch Agent")
+    parser = argparse.ArgumentParser(description="GPU MODE Autoresearch Agent (Stateless Loop)")
     parser.add_argument("--iterations", "-n", type=int, default=50,
-                        help="Total number of agent iterations to run (default: 50)")
+                        help="Total iterations to run (0 = unlimited, default: 50)")
     parser.add_argument("--checkpoint-every", "-c", type=int, default=5,
                         help="Print checkpoint summary every N iterations (default: 5)")
     args = parser.parse_args()
@@ -209,88 +280,117 @@ def main():
     run_name = f"{timestamp}_{gpu_target}_{leaderboard}"
     run_dir = os.path.join(PROJECT_DIR, "runs", run_name)
     os.makedirs(run_dir, exist_ok=True)
-    
-    # Set the run directory for tools to use
+
     set_run_directory(run_dir)
+
+    # Copy submission.py into the run directory — agent works on this copy only
+    import shutil
+    original_submission = os.path.join(PROJECT_DIR, "submission.py")
+    run_submission = os.path.join(run_dir, "submission.py")
+    shutil.copy2(original_submission, run_submission)
 
     total_iterations = args.iterations
     checkpoint_every = args.checkpoint_every
 
-    agent = build_agent()
-
     model_name = os.environ.get("AUTORESEARCH_MODEL", "gpt-5.2")
     starting_iteration = _get_next_iteration() - 1
 
-    print(f"Starting kernel optimization agent...")
+    print(f"Starting kernel optimization agent (stateless loop)...")
     print(f"  Model: {model_name}")
     print(f"  GPU Target: {gpu_target}")
     print(f"  Leaderboard: {leaderboard}")
     print(f"  Run directory: {run_dir}")
-    print(f"  Total iterations: {total_iterations}")
+    print(f"  Iterations: {'unlimited' if total_iterations == 0 else total_iterations}")
     print(f"  Checkpoint every: {checkpoint_every} iterations")
     print(f"  Prior experiments: {starting_iteration}")
     print()
 
-    config = {"configurable": {"thread_id": "kernel-opt-main"}}
     start_time = time.time()
-
-    kickoff_message = (
-        "Read program.md for full instructions. Then call get_experiment_history "
-        "to review any prior attempts. Read the current submission.py — it contains "
-        "an expert-written Blackwell PTX kernel using tcgen05 MMA, TMA, and CTA clustering. "
-        "Your first step should be to benchmark it as-is to establish a baseline. "
-        "Then begin the autonomous optimization loop: propose a hypothesis, "
-        "implement it, submit, log the result, and repeat.\n\n"
-        + read_results_summary()
-    )
-
     iteration = 0
+    consecutive_failures = 0
+    max_consecutive_failures = 10
+
     try:
-        msg = kickoff_message
-        while iteration < total_iterations:
+        while True:
             iteration += 1
 
+            if total_iterations > 0 and iteration > total_iterations:
+                break
+
             print(f"\n{'='*60}")
-            print(f"  Agent iteration {iteration}/{total_iterations}")
+            print(f"  Agent iteration {iteration}{'/' + str(total_iterations) if total_iterations > 0 else ''}")
             print(f"{'='*60}\n")
 
-            result = agent.invoke(
-                {"messages": [{"role": "user", "content": msg}]},
-                config=config,
+            # Fresh agent each iteration — no accumulated context
+            agent = build_agent()
+            config = {"configurable": {"thread_id": f"iter-{iteration}"}}
+
+            prompt = build_iteration_prompt(
+                iteration,
+                total_iterations if total_iterations > 0 else iteration,
+                run_dir,
             )
 
-            n_msgs = len(result["messages"])
-            final = result["messages"][-1]
-            content = (
-                final.content
-                if hasattr(final, "content")
-                else str(final)
-            )
-            print(f"\n--- Agent yielded ({n_msgs} messages) ---")
-            print(content[:500] if content else "(empty)")
+            try:
+                result = agent.invoke(
+                    {"messages": [{"role": "user", "content": prompt}]},
+                    config=config,
+                )
 
-            # Checkpoint every Y iterations
+                n_msgs = len(result["messages"])
+                final = result["messages"][-1]
+                content = (
+                    final.content
+                    if hasattr(final, "content")
+                    else str(final)
+                )
+                
+                # Log the full conversation for debugging
+                log_conversation(run_dir, iteration, prompt, content or "(empty)")
+                
+                print(f"\n--- Agent completed (used {n_msgs} messages) ---")
+                print(content[:500] if content else "(empty)")
+
+                # The agent's final text can be empty if its last action was a
+                # tool call (e.g. log_experiment). That's fine — it still did work.
+                # Only count as failure if the agent barely did anything (<=3 msgs
+                # means it didn't even make a single tool call).
+                if n_msgs > 3:
+                    consecutive_failures = 0
+                else:
+                    consecutive_failures += 1
+                    print(f"  WARNING: Agent did no work ({consecutive_failures}/{max_consecutive_failures})")
+
+            except Exception as e:
+                consecutive_failures += 1
+                error_msg = f"Agent framework error: {e}\n{traceback.format_exc()}"
+                
+                # Log the error conversation
+                log_conversation(run_dir, iteration, prompt, f"ERROR: {error_msg}")
+                
+                print(f"\n--- Agent framework error: {e} ({consecutive_failures}/{max_consecutive_failures}) ---")
+                traceback.print_exc()
+
+            if consecutive_failures >= max_consecutive_failures:
+                print(f"\n--- Too many consecutive failures, stopping ---")
+                break
+
+            # Checkpoint
             if iteration % checkpoint_every == 0:
-                print_checkpoint(iteration, total_iterations, start_time)
-
-            # Build rich context for next iteration with recent results
-            recent_summary = read_results_summary()
-            msg = (
-                f"Continue the optimization loop. Iteration {iteration + 1}/{total_iterations}.\n\n"
-                f"{recent_summary}\n"
-                "Call get_experiment_history for full prior code traces. "
-                "Then propose and implement the next experiment. "
-                "Do not summarize or ask for instructions — just act."
-            )
+                print_checkpoint(
+                    iteration,
+                    total_iterations if total_iterations > 0 else iteration,
+                    start_time,
+                )
 
     except KeyboardInterrupt:
         print(f"\n\n--- Interrupted by user at iteration {iteration} ---")
-    except Exception as e:
-        print(f"\n--- Agent error at iteration {iteration}: {e} ---")
-        import traceback
-        traceback.print_exc()
     finally:
-        print_final_report(total_iterations, iteration, start_time)
+        print_final_report(
+            total_iterations if total_iterations > 0 else iteration,
+            iteration,
+            start_time,
+        )
 
 
 if __name__ == "__main__":

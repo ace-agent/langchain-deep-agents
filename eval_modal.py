@@ -30,8 +30,8 @@ gpu_image = (
 @app.function(gpu="B200", image=gpu_image, timeout=600)
 def evaluate_kernel(
     kernel_code: str,
-    warmup_iters: int = 5,
-    eval_iters: int = 10,
+    warmup_iters: int = 10,
+    eval_iters: int = 50,
 ) -> str:
     import torch
     import platform
@@ -287,19 +287,29 @@ def evaluate_kernel(
         return json.dumps(result)
 
     try:
+        import time
         case_times = []
+        case_medians = []
 
         for bi, bcase in enumerate(BENCHMARK_CASES):
             g = bcase["g"]
 
+            # Warmup phase
             for _ in range(warmup_iters):
                 data = generate_input(bcase["m"], bcase["n"], bcase["k"], g, bcase["seed"])
                 _ = custom_kernel(data)
                 torch.cuda.synchronize()
 
+            # Small cooldown to let clocks/thermals stabilize after warmup burst
+            torch.cuda.synchronize()
+            time.sleep(0.01)
+
             timings_us = []
             for _ in range(eval_iters):
                 data = generate_input(bcase["m"], bcase["n"], bcase["k"], g, bcase["seed"])
+                
+                # Clear cache for consistent allocator state
+                torch.cuda.empty_cache()
                 torch.cuda.synchronize()
 
                 start_evt = torch.cuda.Event(enable_timing=True)
@@ -313,12 +323,19 @@ def evaluate_kernel(
                 elapsed_ms = start_evt.elapsed_time(end_evt)
                 timings_us.append(elapsed_ms * 1000.0)
 
-            mean_us = sum(timings_us) / len(timings_us)
-            variance = sum((t - mean_us) ** 2 for t in timings_us) / len(timings_us)
+            # Sort for percentile calculations
+            timings_us.sort()
+            n = len(timings_us)
+            
+            mean_us = sum(timings_us) / n
+            median_us = timings_us[n // 2]
+            variance = sum((t - mean_us) ** 2 for t in timings_us) / n
             std_us = math.sqrt(variance)
-            stderr_us = std_us / math.sqrt(len(timings_us))
-            min_us = min(timings_us)
-            max_us = max(timings_us)
+            stderr_us = std_us / math.sqrt(n)
+            min_us = timings_us[0]
+            max_us = timings_us[-1]
+            p10_us = timings_us[n // 10]
+            p90_us = timings_us[int(n * 0.9)]
 
             case_detail = {
                 "case_idx": bi,
@@ -327,19 +344,26 @@ def evaluate_kernel(
                 "n": bcase["n"],
                 "k": bcase["k"],
                 "mean_us": round(mean_us, 1),
+                "median_us": round(median_us, 1),
                 "std_us": round(std_us, 2),
                 "stderr_us": round(stderr_us, 1),
                 "min_us": round(min_us, 1),
                 "max_us": round(max_us, 1),
+                "p10_us": round(p10_us, 1),
+                "p90_us": round(p90_us, 1),
             }
             result["benchmark_details"].append(case_detail)
             case_times.append(mean_us)
+            case_medians.append(median_us)
 
-        geomean = math.exp(sum(math.log(t) for t in case_times) / len(case_times))
+        geomean_mean = math.exp(sum(math.log(t) for t in case_times) / len(case_times))
+        geomean_median = math.exp(sum(math.log(t) for t in case_medians) / len(case_medians))
 
         result["benchmark"] = {
-            "geomean_us": round(geomean, 1),
+            "geomean_us": round(geomean_mean, 1),
+            "geomean_median_us": round(geomean_median, 1),
             "case_times_us": [round(t, 1) for t in case_times],
+            "case_medians_us": [round(t, 1) for t in case_medians],
             "num_cases": len(case_times),
         }
         result["success"] = True

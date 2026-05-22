@@ -117,13 +117,47 @@ def _update_plot():
     else:
         y_lo, y_hi = -100, 0
 
+    # Plot baseline (iteration 1) first, regardless of status
+    baseline_iteration = 1
+    baseline_status = None
+    baseline_time = None
+    
+    if baseline_iteration in iterations:
+        idx = iterations.index(baseline_iteration)
+        baseline_status = statuses[idx] 
+        baseline_time = times[idx]
+        
+        if baseline_status == "keep" and baseline_time and baseline_time > 0:
+            ax.scatter([baseline_iteration], [-baseline_time], c="#22c55e", s=120, zorder=7, label="baseline", edgecolors="gold", linewidths=2, marker="^")
+        elif baseline_status == "discard" and baseline_time and baseline_time > 0:
+            ax.scatter([baseline_iteration], [-baseline_time], c="#ef4444", s=120, zorder=7, label="baseline", edgecolors="gold", linewidths=2, marker="^")
+        elif baseline_status == "crash":
+            # For crashed baseline, show it at the bottom of the plot
+            crash_y = y_lo if 'y_lo' in locals() else -100
+            ax.scatter([baseline_iteration], [crash_y], c="#fbbf24", s=120, zorder=7, label="baseline (crash)", edgecolors="gold", linewidths=2, marker="^")
+
     if keep_y:
-        ax.scatter(keep_x, keep_y, c="#22c55e", s=60, zorder=5, label="keep", edgecolors="white", linewidths=0.5)
+        # Plot regular keep points (excluding baseline which is handled above)
+        regular_keep_x = [x for x in keep_x if x != baseline_iteration]
+        regular_keep_y = [y for x, y in zip(keep_x, keep_y) if x != baseline_iteration]
+        
+        if regular_keep_x:
+            ax.scatter(regular_keep_x, regular_keep_y, c="#22c55e", s=60, zorder=5, label="keep", edgecolors="white", linewidths=0.5)
+    
     if discard_y:
-        ax.scatter(discard_x, discard_y, c="#ef4444", s=40, zorder=4, label="discard", edgecolors="white", linewidths=0.5, alpha=0.7)
+        # Plot regular discard points (excluding baseline which is handled above)
+        regular_discard_x = [x for x in discard_x if x != baseline_iteration]
+        regular_discard_y = [y for x, y in zip(discard_x, discard_y) if x != baseline_iteration]
+        
+        if regular_discard_x:
+            ax.scatter(regular_discard_x, regular_discard_y, c="#ef4444", s=40, zorder=4, label="discard", edgecolors="white", linewidths=0.5, alpha=0.7)
 
     if crash_x:
-        ax.scatter(crash_x, [y_lo] * len(crash_x), c="#fbbf24", s=25, zorder=3, label=f"crash ({len(crash_x)})", marker="x", alpha=0.6)
+        # Plot regular crashes (excluding baseline which is handled above)
+        regular_crash_x = [x for x in crash_x if x != baseline_iteration]
+        
+        if regular_crash_x:
+            ax.scatter(regular_crash_x, [y_lo] * len(regular_crash_x), c="#fbbf24", s=25, zorder=3, label=f"crash ({len(regular_crash_x)})", marker="x", alpha=0.6)
 
     valid_best = [(it, -bt) for it, bt in zip(iterations, best_times) if bt is not None]  # Negative best times
     if valid_best:
@@ -131,6 +165,22 @@ def _update_plot():
         ax.step(bx, by, where="post", color="#3b82f6", linewidth=2, label="best time", zorder=6)
 
     ax.set_ylim(y_lo, y_hi)
+    
+    # Set x-axis to show full expected iteration range (0 to ~50)
+    if iterations:
+        max_iter = max(iterations)
+        # Show full range: start at 0, end at reasonable total (50) or current max + buffer
+        expected_total = max(50, max_iter + 10)  # At least 50, or current progress + buffer
+        ax.set_xlim(0, expected_total)
+        # Set reasonable tick spacing based on range
+        if expected_total <= 20:
+            tick_spacing = 2
+        elif expected_total <= 50:
+            tick_spacing = 5
+        else:
+            tick_spacing = 10
+        ax.xaxis.set_major_locator(ticker.MultipleLocator(tick_spacing))
+    
     ax.yaxis.set_major_formatter(ticker.FormatStrFormatter("%.0f"))
     ax.set_xlabel("Iteration", fontsize=12)
     ax.set_ylabel("Negative Latency (-μs)", fontsize=12)
@@ -203,8 +253,9 @@ def log_experiment(
 
     try:
         _update_plot()
-    except Exception:
-        pass
+        plot_msg = f" (plot updated: {os.path.basename(PLOT_FILE)})"
+    except Exception as e:
+        plot_msg = f" (plot update failed: {e})"
 
     if status == "keep" and _run_directory and kernel_code.strip():
         best_path = os.path.join(_run_directory, "best_submission.py")
@@ -212,20 +263,22 @@ def log_experiment(
             f.write(kernel_code)
 
     if status == "crash":
-        return f"Logged iteration #{iteration} CRASH: {hypothesis}"
-    return f"Logged iteration #{iteration} {status}: {time_us:.2f} μs — {hypothesis}"
+        return f"Logged iteration #{iteration} CRASH: {hypothesis}{plot_msg}"
+    return f"Logged iteration #{iteration} {status}: {time_us:.2f} μs — {hypothesis}{plot_msg}"
 
 
 @tool
-def get_experiment_history() -> str:
-    """Read the full experiment history markdown file.
+def get_experiment_history(last_n: int = 10) -> str:
+    """Read recent experiment history from experiment_history.md.
 
-    Returns the contents of experiment_history.md which contains every prior
-    kernel attempt, its code, hypothesis, and result. The agent should call
-    this before proposing a new kernel to learn from past attempts.
+    Returns the last N experiments (hypothesis, result, kernel code).
+    For older experiments, use grep on experiment_history.md or read results.tsv.
+
+    Args:
+        last_n: Number of most recent experiments to return. Defaults to 10.
 
     Returns:
-        The full markdown contents, or a message if no history exists yet.
+        The recent experiment entries, or a message if no history exists yet.
     """
     if not os.path.exists(HISTORY_FILE):
         return "No experiment history yet. This will be the first run."
@@ -233,7 +286,27 @@ def get_experiment_history() -> str:
     with open(HISTORY_FILE, "r") as f:
         content = f.read()
 
-    if len(content) > 50000:
-        return content[-50000:]
+    # Split into individual experiment sections
+    sections = content.split("---\n\n## Experiment #")
+    if len(sections) <= 1:
+        # No experiments logged yet, or only the header
+        if len(content) < 500:
+            return content
+        return content[-30000:]
 
-    return content
+    header = sections[0]
+    experiments = sections[1:]
+
+    # Return last N experiments
+    recent = experiments[-last_n:]
+    result = header.rstrip() + "\n\n"
+    if len(experiments) > last_n:
+        result += f"[... {len(experiments) - last_n} earlier experiments omitted — use grep to search ...]\n\n"
+    for exp in recent:
+        result += f"---\n\n## Experiment #{exp}"
+
+    # Safety cap
+    if len(result) > 80000:
+        result = result[-80000:]
+
+    return result
